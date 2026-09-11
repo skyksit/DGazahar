@@ -319,16 +319,24 @@ static void setup_memory_maps() {
         if (vma.size == 0 || !vma.backing_memory)
             continue;
 
-        // Only expose the well-known user-accessible memory regions
+        // Only expose the well-known user-accessible memory regions.
+        //
+        // NOTE: the guest-virtual descriptors deliberately carry NO flags. This function runs
+        // exactly once, at the end of do_load_game(), and at that point the only VMA inside the
+        // heap range is the main thread stack -- the game allocates its real heap/linear heap
+        // later, through svcControlMemory. Advertising that snapshot as RETRO_MEMDESC_SYSTEM_RAM
+        // makes frontend RAM search scan a few dozen KB of stack and find nothing. The single
+        // FCRAM descriptor appended below is the stable system-RAM window instead.
+        // (Consumers that map by address, such as rcheevos, ignore these flags entirely.)
         uint64_t flags = 0;
         if (vma.base >= Memory::HEAP_VADDR && vma.base < Memory::HEAP_VADDR_END) {
-            flags = RETRO_MEMDESC_SYSTEM_RAM;
+            flags = 0;
         } else if (vma.base >= Memory::LINEAR_HEAP_VADDR &&
                    vma.base < Memory::LINEAR_HEAP_VADDR_END) {
-            flags = RETRO_MEMDESC_SYSTEM_RAM;
+            flags = 0;
         } else if (vma.base >= Memory::NEW_LINEAR_HEAP_VADDR &&
                    vma.base < Memory::NEW_LINEAR_HEAP_VADDR_END) {
-            flags = RETRO_MEMDESC_SYSTEM_RAM;
+            flags = 0;
         } else if (vma.base >= Memory::VRAM_VADDR && vma.base < Memory::VRAM_VADDR_END) {
             flags = RETRO_MEMDESC_VIDEO_RAM;
         } else {
@@ -360,6 +368,29 @@ static void setup_memory_maps() {
         }
 
         descs.push_back(desc);
+    }
+
+    // Every guest VMA -- code, rodata, data/bss, stack, heap and linear heap alike -- is carved
+    // out of the process' APPLICATION region in FCRAM (see Process::HeapAllocate /
+    // Process::LinearAllocate, both of which allocate through memory_region). That region is a
+    // single contiguous host allocation whose pointer and size never change for the lifetime of
+    // the session, which makes it the only stable window a frontend can scan for cheat searching.
+    auto& system = Core::System::GetInstance();
+    if (auto region = system.Kernel().GetMemoryRegion(Kernel::MemoryRegion::APPLICATION);
+        region != nullptr && region->size > 0) {
+        if (u8* fcram = system.Memory().GetFCRAMPointer(region->base)) {
+            retro_memory_descriptor desc = {};
+            desc.flags = RETRO_MEMDESC_SYSTEM_RAM;
+            desc.ptr = fcram;
+            // Physical address: keeps this descriptor from overlapping the guest-virtual ones
+            // above, which alias the very same host memory.
+            desc.start = Memory::FCRAM_PADDR + region->base;
+            desc.len = region->size;
+            desc.addrspace = "FCRAM";
+            descs.push_back(desc);
+        } else {
+            LOG_WARNING(Frontend, "FCRAM pointer unavailable, cheat search will be unsupported");
+        }
     }
 
     if (!descs.empty()) {
@@ -737,14 +768,38 @@ bool retro_unserialize(const void* data, size_t size) {
     }
 }
 
+// Exposes the same APPLICATION FCRAM window that setup_memory_maps() advertises, for frontends
+// that only implement the legacy per-id memory interface. Both paths must agree, so that it does
+// not matter which one a frontend happens to prefer.
+static std::shared_ptr<Kernel::MemoryRegionInfo> get_application_memory_region() {
+    auto& system = Core::System::GetInstance();
+    if (!system.IsPoweredOn()) {
+        return nullptr;  // may be called before retro_load_game
+    }
+    auto region = system.Kernel().GetMemoryRegion(Kernel::MemoryRegion::APPLICATION);
+    if (region == nullptr || region->size == 0) {
+        return nullptr;
+    }
+    return region;
+}
+
 void* retro_get_memory_data(unsigned id) {
-    // Memory is exposed via RETRO_ENVIRONMENT_SET_MEMORY_MAPS instead,
-    // using virtual addresses for stable cheat/achievement support.
-    return NULL;
+    if (id != RETRO_MEMORY_SYSTEM_RAM) {
+        return NULL;
+    }
+    auto region = get_application_memory_region();
+    if (region == nullptr) {
+        return NULL;
+    }
+    return Core::System::GetInstance().Memory().GetFCRAMPointer(region->base);
 }
 
 size_t retro_get_memory_size(unsigned id) {
-    return 0;
+    if (id != RETRO_MEMORY_SYSTEM_RAM) {
+        return 0;
+    }
+    auto region = get_application_memory_region();
+    return region != nullptr ? region->size : 0;
 }
 
 void retro_cheat_reset() {}
