@@ -61,7 +61,11 @@
 
 class CitraLibRetro {
 public:
-    CitraLibRetro() : log_filter(Common::Log::Level::Debug) {}
+    // Info, like Citra's own default ("*:Info"): now that the libretro backend actually delivers
+    // messages, a Debug filter would format and enqueue every HLE "called" line on the emulation
+    // thread only for the frontend to drop it (RetroArch and LibretroDroid both discard
+    // RETRO_LOG_DEBUG by default).
+    CitraLibRetro() : log_filter(Common::Log::Level::Info) {}
 
     Common::Log::Filter log_filter;
     std::unique_ptr<EmuWindow_LibRetro> emu_window;
