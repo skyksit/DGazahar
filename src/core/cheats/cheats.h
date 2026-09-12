@@ -47,6 +47,16 @@ public:
     /// Loads the cheat file from disk for the specified title id.
     void LoadCheatFile(u64 title_id);
 
+    /**
+     * Re-reads the cheat file from disk even if it is already loaded.
+     *
+     * LoadCheatFile() bails out when the same title is already loaded, which means a frontend
+     * that edits the cheat file while the game runs cannot get the change applied until the
+     * next boot. This forgets the memo and reloads, so a host-side cheat editor can take effect
+     * immediately.
+     */
+    void ReloadCheatFile(u64 title_id);
+
     /// Saves currently active cheats to file for the specified title id.
     void SaveCheatFile(u64 title_id) const;
 

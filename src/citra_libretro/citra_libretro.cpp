@@ -4,6 +4,8 @@
 
 #include <list>
 #include <numeric>
+#include <filesystem>
+#include <fmt/format.h>
 #include <vector>
 #include <math.h>
 #include <stdint.h>
@@ -37,6 +39,7 @@
 #if CITRA_ARCH(x86_64)
 #include "common/x64/cpu_detect.h"
 #endif
+#include "common/file_util.h"
 #include "common/logging/backend.h"
 #include "common/logging/filter.h"
 #include "common/settings.h"
@@ -46,6 +49,7 @@
 #include "core/frontend/image_interface.h"
 #include "core/hle/kernel/kernel.h"
 #include "core/hle/kernel/memory.h"
+#include "core/cheats/cheats.h"
 #include "core/hle/kernel/process.h"
 #include "core/loader/loader.h"
 #include "core/memory.h"
@@ -223,6 +227,8 @@ void retro_run() {
         return;
     }
 
+    poll_cheat_file();
+
     // Check to see if we actually have any config updates to process.
     if (LibRetro::HasUpdatedConfig()) {
         LibRetro::ParseCoreOptions();
@@ -304,6 +310,66 @@ void retro_run() {
             LibRetro::DisplayMessage(msg.c_str());
         }
     }
+}
+
+// ── Cheat file hot-reload ────────────────────────────────────────────────────────────────────
+//
+// CheatEngine::LoadCheatFile() is called once, from System::Load(), and returns early when the
+// same title is already loaded. A frontend that lets the user toggle cheats while the game runs
+// therefore cannot get the change applied until the next boot, which makes an in-game cheat
+// editor feel broken.
+//
+// Watching the file is preferable to adding a frontend-triggered reload: it needs no libretro API
+// of its own, and it works no matter which process wrote the file (Android frontends often run
+// the menu UI in a different process than the emulator).
+//
+// The cheat file is a few KB and the check runs once a second, so the stat is free in practice.
+static u64 cheat_watch_title_id = 0;
+static std::string cheat_watch_path;
+static std::filesystem::file_time_type cheat_watch_mtime{};
+static u64 cheat_watch_size = 0;
+static int cheat_watch_counter = 0;
+
+static constexpr int kCheatWatchIntervalFrames = 60;
+
+/// Records the file state as of load time so the first poll does not report a spurious change.
+static void setup_cheat_watch(u64 title_id) {
+    cheat_watch_title_id = title_id;
+    cheat_watch_path =
+        FileUtil::GetUserPath(FileUtil::UserPath::CheatsDir) + fmt::format("{:016X}.txt", title_id);
+    std::error_code ec;
+    cheat_watch_mtime = std::filesystem::last_write_time(cheat_watch_path, ec);
+    if (ec) {
+        cheat_watch_mtime = {};
+    }
+    cheat_watch_size = FileUtil::Exists(cheat_watch_path) ? FileUtil::GetSize(cheat_watch_path) : 0;
+}
+
+/// Reloads the cheat file when it changed on disk. Cheap enough to call every frame, but gated
+/// anyway so a missing file does not turn into one stat per frame.
+static void poll_cheat_file() {
+    if (cheat_watch_title_id == 0) {
+        return;
+    }
+    if (++cheat_watch_counter < kCheatWatchIntervalFrames) {
+        return;
+    }
+    cheat_watch_counter = 0;
+
+    std::error_code ec;
+    const auto mtime = std::filesystem::last_write_time(cheat_watch_path, ec);
+    const auto stamp = ec ? std::filesystem::file_time_type{} : mtime;
+    const u64 size = FileUtil::Exists(cheat_watch_path) ? FileUtil::GetSize(cheat_watch_path) : 0;
+    // Size is checked as well: some filesystems have a coarse mtime resolution, and a toggle can
+    // land inside the same tick as the previous write.
+    if (stamp == cheat_watch_mtime && size == cheat_watch_size) {
+        return;
+    }
+    cheat_watch_mtime = stamp;
+    cheat_watch_size = size;
+
+    LOG_INFO(Core_Cheats, "Cheat file changed, reloading: {}", cheat_watch_path);
+    Core::System::GetInstance().CheatEngine().ReloadCheatFile(cheat_watch_title_id);
 }
 
 static void setup_memory_maps() {
@@ -438,6 +504,7 @@ static bool do_load_game() {
     u64 program_id{};
     Core::System::GetInstance().GetAppLoader().ReadProgramId(program_id);
     Core::System::GetInstance().GPU().ApplyPerProgramSettings(program_id);
+    setup_cheat_watch(program_id);
 
     if (Settings::values.use_disk_shader_cache) {
         Core::System::GetInstance().GPU().Renderer().Rasterizer()->LoadDefaultDiskResources(
