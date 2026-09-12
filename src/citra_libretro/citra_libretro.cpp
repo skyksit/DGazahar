@@ -2,6 +2,7 @@
 // Licensed under GPLv2 or any later version
 // Refer to the license.txt file included.
 
+#include <chrono>
 #include <list>
 #include <numeric>
 #include <filesystem>
@@ -215,9 +216,6 @@ static void UpdateSettings() {
     Core::System::GetInstance().ApplySettings();
 }
 
-/**
- * libretro callback; Called every game tick.
- */
 // ── Cheat file hot-reload ────────────────────────────────────────────────────────────────────
 //
 // CheatEngine::LoadCheatFile() is called once, from System::Load(), and returns early when the
@@ -229,45 +227,65 @@ static void UpdateSettings() {
 // of its own, and it works no matter which process wrote the file (Android frontends often run
 // the menu UI in a different process than the emulator).
 //
-// The cheat file is a few KB and the check runs once a second, so the stat is free in practice.
+// The poll runs from retro_run() on the emulation thread, at most once per second of wall-clock
+// time, and costs two stat() calls when the file exists (one when it does not). Frames in between
+// pay a single steady_clock read. The interval is wall-clock rather than a frame count on purpose:
+// frontends stop calling retro_run() while their in-game menu is open, so after the user toggles
+// cheats and returns, the very first frame sees the elapsed time and reloads immediately instead
+// of waiting for a frame counter to wrap. Fast-forward does not raise the poll rate either.
+//
+// Reloading parses the file inside retro_run() (CheatEngine::LoadCheatFile does its I/O outside
+// cheats_list_mutex, so RunCallback is never blocked) — one hitch per change, which on the
+// menu-return path coincides with the screen transition.
 static u64 cheat_watch_title_id = 0;
 static std::string cheat_watch_path;
 static std::filesystem::file_time_type cheat_watch_mtime{};
 static u64 cheat_watch_size = 0;
-static int cheat_watch_counter = 0;
+static std::chrono::steady_clock::time_point cheat_watch_last_poll{};
 
-static constexpr int kCheatWatchIntervalFrames = 60;
+static constexpr auto kCheatWatchInterval = std::chrono::seconds(1);
+
+/// Reads the (mtime, size) pair that identifies the current file contents. A missing or unreadable
+/// file maps to the empty stamp, so both "created" and "deleted" register as changes.
+static void read_cheat_watch_stamp(std::filesystem::file_time_type& stamp, u64& size) {
+    std::error_code ec;
+    const auto mtime = std::filesystem::last_write_time(cheat_watch_path, ec);
+    if (ec) {
+        stamp = {};
+        size = 0;
+        return;
+    }
+    stamp = mtime;
+    // Size is tracked as well: some filesystems have a coarse mtime resolution, and a toggle can
+    // land inside the same tick as the previous write.
+    const auto file_size = std::filesystem::file_size(cheat_watch_path, ec);
+    size = ec ? 0 : static_cast<u64>(file_size);
+}
 
 /// Records the file state as of load time so the first poll does not report a spurious change.
 static void setup_cheat_watch(u64 title_id) {
     cheat_watch_title_id = title_id;
     cheat_watch_path =
         FileUtil::GetUserPath(FileUtil::UserPath::CheatsDir) + fmt::format("{:016X}.txt", title_id);
-    std::error_code ec;
-    cheat_watch_mtime = std::filesystem::last_write_time(cheat_watch_path, ec);
-    if (ec) {
-        cheat_watch_mtime = {};
-    }
-    cheat_watch_size = FileUtil::Exists(cheat_watch_path) ? FileUtil::GetSize(cheat_watch_path) : 0;
+    read_cheat_watch_stamp(cheat_watch_mtime, cheat_watch_size);
+    cheat_watch_last_poll = std::chrono::steady_clock::now();
 }
 
-/// Reloads the cheat file when it changed on disk. Cheap enough to call every frame, but gated
-/// anyway so a missing file does not turn into one stat per frame.
+/// Reloads the cheat file when it changed on disk. Called every frame; returns after a clock read
+/// until kCheatWatchInterval has elapsed since the previous poll.
 static void poll_cheat_file() {
     if (cheat_watch_title_id == 0) {
         return;
     }
-    if (++cheat_watch_counter < kCheatWatchIntervalFrames) {
+    const auto now = std::chrono::steady_clock::now();
+    if (now - cheat_watch_last_poll < kCheatWatchInterval) {
         return;
     }
-    cheat_watch_counter = 0;
+    cheat_watch_last_poll = now;
 
-    std::error_code ec;
-    const auto mtime = std::filesystem::last_write_time(cheat_watch_path, ec);
-    const auto stamp = ec ? std::filesystem::file_time_type{} : mtime;
-    const u64 size = FileUtil::Exists(cheat_watch_path) ? FileUtil::GetSize(cheat_watch_path) : 0;
-    // Size is checked as well: some filesystems have a coarse mtime resolution, and a toggle can
-    // land inside the same tick as the previous write.
+    std::filesystem::file_time_type stamp{};
+    u64 size = 0;
+    read_cheat_watch_stamp(stamp, size);
     if (stamp == cheat_watch_mtime && size == cheat_watch_size) {
         return;
     }
@@ -278,6 +296,9 @@ static void poll_cheat_file() {
     Core::System::GetInstance().CheatEngine().ReloadCheatFile(cheat_watch_title_id);
 }
 
+/**
+ * libretro callback; Called every game tick.
+ */
 void retro_run() {
     if (!emu_instance->game_loaded) {
         // Game failed to load (e.g. encrypted ROM, bad path).
