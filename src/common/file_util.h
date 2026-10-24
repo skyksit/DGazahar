@@ -306,6 +306,7 @@ public:
         CryptoFile,
         Z3DSWriteIOFile,
         Z3DSReadIOFile,
+        NCCHDecryptFile,
 
         MAX,
     };
@@ -335,6 +336,7 @@ public:
             "CryptoFile",
             "Z3DSWriteIOFile",
             "Z3DSReadIOFile",
+            "NCCHDecryptFile",
         }};
 
         std::string ret;

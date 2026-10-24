@@ -13,7 +13,9 @@
 #include "common/logging/log.h"
 #include "core/core.h"
 #include "core/file_sys/layered_fs.h"
+#include "core/file_sys/cia_container.h"
 #include "core/file_sys/ncch_container.h"
+#include "core/file_sys/ncch_crypto.h"
 #include "core/file_sys/patch.h"
 #include "core/file_sys/seed_db.h"
 #include "core/hw/aes/key.h"
@@ -112,6 +114,40 @@ static bool LZSS_Decompress(std::span<const u8> compressed, std::span<u8> decomp
     return true;
 }
 
+/**
+ * DGPlayer: exposes content 0 of a CIA as a sub file, or returns nullptr if the file is not a
+ * usable CIA. Only the title key layer must be absent; NCCH encryption is handled later by
+ * NCCHDecryptIOFile.
+ */
+static std::unique_ptr<FileUtil::IOFileBase> OpenCIAContent0(FileUtil::IOFileBase* in_file) {
+    // CIAContainer::LoadHeader does not validate anything, so check the fixed header size
+    // first to avoid allocating garbage section sizes for files that are not CIAs.
+    u32 header_size = 0;
+    if (in_file->ReadAtArray<u32>(&header_size, 1, 0) != sizeof(header_size) ||
+        header_size != CIA_HEADER_SIZE) {
+        return nullptr;
+    }
+
+    std::unique_ptr<FileUtil::IOFileBase> file = in_file->OpenCopy();
+    if (!file->IsOpen() || !file->Seek(0, SEEK_SET)) {
+        return nullptr;
+    }
+    CIAContainer cia;
+    if (cia.Load(file.get()) != Loader::ResultStatus::Success) {
+        return nullptr;
+    }
+    const u64 size = cia.GetContentSize(0);
+    if (size == 0) {
+        LOG_ERROR(Service_FS, "CIA has no content 0");
+        return nullptr;
+    }
+    if (cia.GetTitleMetadata().HasEncryptedContent(cia.GetHeader())) {
+        LOG_ERROR(Service_FS, "CIA contents are encrypted with a title key, which is unsupported");
+        return nullptr;
+    }
+    return std::make_unique<FileUtil::SubIOFile>(std::move(file), cia.GetContentOffset(0), size);
+}
+
 std::unique_ptr<FileUtil::IOFileBase> NCCHContainer::AutoOpenNCCHNCSD(const std::string& filepath) {
     std::unique_ptr<FileUtil::IOFileBase> file = std::make_unique<FileUtil::IOFile>(filepath, "rb");
     return AutoOpenNCCHNCSD(file.get());
@@ -159,7 +195,17 @@ std::unique_ptr<FileUtil::IOFileBase> NCCHContainer::AutoOpenNCCHNCSD(
             }
         }
 
-        // 3rd: File not recognized
+        // 3rd (DGPlayer): CIA, booted directly from its first content (the executable NCCH)
+        if (auto content = OpenCIAContent0(file.get())) {
+            file = std::move(content);
+            if (has_ncch_magic(file.get())) {
+                return file;
+            } else {
+                continue;
+            }
+        }
+
+        // 4th: File not recognized
         return std::make_unique<FileUtil::NullIOFile>();
     }
 }
@@ -221,12 +267,21 @@ Loader::ResultStatus NCCHContainer::LoadHeader() {
         }
     }
 
-    LOG_DEBUG(Service_FS, "NCCH type: {}", file->GetType().to_string());
-
     if (!ncch_header.no_crypto) {
-        // Encrypted NCCH are not supported
-        return Loader::ResultStatus::ErrorEncrypted;
+        // DGPlayer: decrypt on read with the keys from the user's aes_keys.txt (same behaviour
+        // as Citra). Without the keys this still fails with ErrorEncrypted.
+        const auto keys = DeriveNCCHCryptoKeys(ncch_header);
+        if (!keys) {
+            return Loader::ResultStatus::ErrorEncrypted;
+        }
+        file = std::make_unique<NCCHDecryptIOFile>(std::move(file), ncch_header, *keys);
+        if (file->ReadAtBytes(&ncch_header, sizeof(NCCH_Header), 0) != sizeof(NCCH_Header)) {
+            return Loader::ResultStatus::Error;
+        }
+        LOG_INFO(Service_FS, "Decrypting NCCH {:016X} on the fly", ncch_header.program_id);
     }
+
+    LOG_DEBUG(Service_FS, "NCCH type: {}", file->GetType().to_string());
 
     has_header = true;
     return Loader::ResultStatus::Success;
@@ -640,7 +695,8 @@ Loader::ResultStatus NCCHContainer::ReadRomFS(std::shared_ptr<RomFSReader>& romf
 }
 
 Loader::ResultStatus NCCHContainer::DumpRomFS(const std::string& target_path) {
-    if (file->GetType().HasType(FileUtil::IOType::Type::CryptoFile)) {
+    if (file->GetType().HasType(FileUtil::IOType::Type::CryptoFile) ||
+        file->GetType().HasType(FileUtil::IOType::Type::NCCHDecryptFile)) {
         LOG_ERROR(Service_FS, "File {}, built-in romfs dumping of eShop titles is not allowed.",
                   file->Filename());
         return Loader::ResultStatus::ErrorEncrypted;

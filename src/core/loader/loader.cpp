@@ -112,6 +112,8 @@ static std::unique_ptr<AppLoader> GetFileLoader(Core::System& system, FileUtil::
     // NCCH/NCSD container formats.
     case FileType::CXI:
     case FileType::CCI:
+    // DGPlayer: CIAs boot from their first content (see NCCHContainer::AutoOpenNCCHNCSD)
+    case FileType::CIA:
         return std::make_unique<AppLoader_NCCH>(system, std::move(file), filepath);
 
     case FileType::ARTIC: {
