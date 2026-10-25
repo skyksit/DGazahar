@@ -1,6 +1,6 @@
 // Copyright 2014-2026 Citra Emulator Project / Azahar Emulator Project
-// Licensed under GPLv2 or any later version
-// Refer to the license.txt file included.
+// Licensed under GPLv3 or any later version
+// Refer to the LICENSE.txt file included.
 
 #include <algorithm>
 #include <array>
@@ -62,6 +62,8 @@ const std::vector<UISettings::Shortcut> QtConfig::default_hotkeys{ {
      {QStringLiteral("Audio Volume Down"),        QStringLiteral("Main Window"), {QStringLiteral(""),       QStringLiteral(""), Qt::ApplicationShortcut}},
      {QStringLiteral("Audio Volume Up"),          QStringLiteral("Main Window"), {QStringLiteral(""),       QStringLiteral(""), Qt::ApplicationShortcut}},
      {QStringLiteral("Capture Screenshot"),       QStringLiteral("Main Window"), {QStringLiteral("Ctrl+P"), QStringLiteral(""), Qt::ApplicationShortcut}},
+     {QStringLiteral("Configure"),                QStringLiteral("Main Window"), {QStringLiteral("Ctrl+,"), QStringLiteral(""), Qt::ApplicationShortcut}},
+     {QStringLiteral("Configure Current Application"),        QStringLiteral("Main Window"), {QStringLiteral("Ctrl+."), QStringLiteral(""), Qt::ApplicationShortcut}},
      {QStringLiteral("Continue/Pause Emulation"), QStringLiteral("Main Window"), {QStringLiteral("F4"),     QStringLiteral(""), Qt::ApplicationShortcut}},
      {QStringLiteral("Debug Pause"),              QStringLiteral("Main Window"), {QStringLiteral(""),       QStringLiteral(""), Qt::ApplicationShortcut}},
      {QStringLiteral("Debug Resume"),             QStringLiteral("Main Window"), {QStringLiteral(""),       QStringLiteral(""), Qt::ApplicationShortcut}},
@@ -94,7 +96,6 @@ const std::vector<UISettings::Shortcut> QtConfig::default_hotkeys{ {
      {QStringLiteral("Toggle 3D"),                QStringLiteral("Main Window"), {QStringLiteral("Ctrl+3"), QStringLiteral(""), Qt::ApplicationShortcut}},
      {QStringLiteral("Toggle Custom Textures"),   QStringLiteral("Main Window"), {QStringLiteral("F7"),     QStringLiteral(""), Qt::ApplicationShortcut}},
      {QStringLiteral("Toggle Filter Bar"),        QStringLiteral("Main Window"), {QStringLiteral("Ctrl+F"), QStringLiteral(""), Qt::ApplicationShortcut}},
-     {QStringLiteral("Toggle Frame Advancing"),   QStringLiteral("Main Window"), {QStringLiteral("Ctrl+A"), QStringLiteral(""), Qt::ApplicationShortcut}},
      {QStringLiteral("Toggle Per-Application Speed"),  QStringLiteral("Main Window"), {QStringLiteral("Ctrl+Z"), QStringLiteral(""), Qt::ApplicationShortcut}},
      {QStringLiteral("Toggle Screen Layout"),     QStringLiteral("Main Window"), {QStringLiteral("F10"),    QStringLiteral(""), Qt::ApplicationShortcut}},
      {QStringLiteral("Toggle Status Bar"),        QStringLiteral("Main Window"), {QStringLiteral("Ctrl+S"), QStringLiteral(""), Qt::ApplicationShortcut}},
@@ -231,15 +232,18 @@ void QtConfig::WriteBasicSetting(const Settings::Setting<std::vector<Type>, rang
     }
     qt_config->setValue(name, stringList);
 }
-// Explicit u16 definition: Qt would store it as QMetaType otherwise, which is not human-readable
-template <>
-void QtConfig::WriteBasicSetting(const Settings::Setting<u16>& setting) {
-    const QString name = QString::fromStdString(setting.GetLabel());
-    const u16& value = setting.GetValue();
-    if (global)
-        qt_config->setValue(name + QStringLiteral("/default"), value == setting.GetDefault());
-    qt_config->setValue(name, static_cast<u32>(value));
-}
+
+// Promote configuration types into simpler types so that Qt does not implicitly convert
+// configuration values into a QMetaType and ensures the ini files are human-readable
+template <typename T>
+using config_promoted_t = std::conditional_t<
+    // Preserve bools
+    std::is_same_v<T, bool>, bool,
+    // Signed/Unsigned integers get promoted to s64/u64
+    std::conditional_t<std::is_integral_v<T>,
+                       std::conditional_t<std::is_signed_v<T>, std::int64_t, std::uint64_t>,
+                       // Otherwise, leave the type unchanged
+                       T>>;
 
 template <typename Type, bool ranged>
 void QtConfig::WriteBasicSetting(const Settings::Setting<Type, ranged>& setting) {
@@ -248,9 +252,11 @@ void QtConfig::WriteBasicSetting(const Settings::Setting<Type, ranged>& setting)
     if (global)
         qt_config->setValue(name + QStringLiteral("/default"), value == setting.GetDefault());
     if constexpr (std::is_enum_v<Type>) {
-        qt_config->setValue(name, static_cast<std::underlying_type_t<Type>>(value));
+        using TypeU = std::underlying_type_t<Type>;
+        qt_config->setValue(
+            name, QVariant::fromValue<config_promoted_t<TypeU>>(static_cast<TypeU>(value)));
     } else {
-        qt_config->setValue(name, QVariant::fromValue(value));
+        qt_config->setValue(name, QVariant::fromValue<config_promoted_t<Type>>(value));
     }
 }
 
@@ -297,6 +303,7 @@ void QtConfig::ReadAudioValues() {
     if (global) {
         ReadBasicSetting(Settings::values.output_type);
         ReadBasicSetting(Settings::values.output_device);
+        ReadBasicSetting(Settings::values.bypass_audio_effects);
         ReadBasicSetting(Settings::values.input_type);
         ReadBasicSetting(Settings::values.input_device);
     }
@@ -483,6 +490,7 @@ void QtConfig::ReadCoreValues() {
 
     if (global) {
         ReadBasicSetting(Settings::values.use_cpu_jit);
+        ReadBasicSetting(Settings::values.use_fastinterp);
         ReadBasicSetting(Settings::values.delay_start_for_lle_modules);
     }
 
@@ -781,6 +789,9 @@ void QtConfig::ReadSystemValues() {
         ReadBasicSetting(Settings::values.init_time_offset);
         ReadBasicSetting(Settings::values.init_ticks_type);
         ReadBasicSetting(Settings::values.init_ticks_override);
+        ReadBasicSetting(Settings::values.battery_state_source);
+        ReadBasicSetting(Settings::values.battery_charging);
+        ReadBasicSetting(Settings::values.battery_level);
         ReadBasicSetting(Settings::values.steps_per_hour);
         ReadBasicSetting(Settings::values.plugin_loader_enabled);
         ReadBasicSetting(Settings::values.allow_plugin_loader);
@@ -866,6 +877,7 @@ void QtConfig::ReadUIValues() {
         ReadBasicSetting(UISettings::values.pause_when_in_background);
         ReadBasicSetting(UISettings::values.mute_when_in_background);
         ReadBasicSetting(UISettings::values.hide_mouse);
+        ReadBasicSetting(UISettings::values.use_on_screen_software_keyboard);
     }
 
     qt_config->endGroup();
@@ -957,6 +969,7 @@ void QtConfig::SaveAudioValues() {
     if (global) {
         WriteBasicSetting(Settings::values.output_type);
         WriteBasicSetting(Settings::values.output_device);
+        WriteBasicSetting(Settings::values.bypass_audio_effects);
         WriteBasicSetting(Settings::values.input_type);
         WriteBasicSetting(Settings::values.input_device);
     }
@@ -1080,6 +1093,7 @@ void QtConfig::SaveCoreValues() {
 
     if (global) {
         WriteBasicSetting(Settings::values.use_cpu_jit);
+        WriteBasicSetting(Settings::values.use_fastinterp);
         WriteBasicSetting(Settings::values.delay_start_for_lle_modules);
     }
 
@@ -1333,6 +1347,9 @@ void QtConfig::SaveSystemValues() {
         WriteBasicSetting(Settings::values.init_time_offset);
         WriteBasicSetting(Settings::values.init_ticks_type);
         WriteBasicSetting(Settings::values.init_ticks_override);
+        WriteBasicSetting(Settings::values.battery_state_source);
+        WriteBasicSetting(Settings::values.battery_charging);
+        WriteBasicSetting(Settings::values.battery_level);
         WriteBasicSetting(Settings::values.steps_per_hour);
         WriteBasicSetting(Settings::values.plugin_loader_enabled);
         WriteBasicSetting(Settings::values.allow_plugin_loader);
@@ -1401,6 +1418,7 @@ void QtConfig::SaveUIValues() {
         WriteBasicSetting(UISettings::values.pause_when_in_background);
         WriteBasicSetting(UISettings::values.mute_when_in_background);
         WriteBasicSetting(UISettings::values.hide_mouse);
+        WriteBasicSetting(UISettings::values.use_on_screen_software_keyboard);
     }
 
     qt_config->endGroup();

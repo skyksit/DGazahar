@@ -1,6 +1,6 @@
 // Copyright 2023-2026 Citra Emulator Project / Azahar Emulator Project
-// Licensed under GPLv2 or any later version
-// Refer to the license.txt file included.
+// Licensed under GPLv3 or any later version
+// Refer to the LICENSE.txt file included.
 
 #include "common/alignment.h"
 #include "common/literals.h"
@@ -12,6 +12,7 @@
 #include "core/loader/loader.h"
 #include "core/memory.h"
 #include "video_core/pica/pica_core.h"
+#include "video_core/renderer_vulkan/pica_to_vk.h"
 #include "video_core/renderer_vulkan/renderer_vulkan.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
@@ -124,16 +125,19 @@ RasterizerVulkan::RasterizerVulkan(Memory::MemorySystem& memory, Pica::PicaCore&
     Surface& null_surface = res_cache.GetSurface(VideoCore::NULL_SURFACE_ID);
     Sampler& null_sampler = res_cache.GetSampler(VideoCore::NULL_SAMPLER_ID);
 
+    const vk::ImageView null_surface_view =
+        instance.IsNullDescriptorSupported() ? vk::ImageView{} : null_surface.ImageView();
+    const vk::ImageView null_surface_storage_view =
+        instance.IsNullDescriptorSupported() ? vk::ImageView{} : null_surface.StorageView();
+
     // Prepare texture and utility descriptor sets.
-    for (u32 i = 0; i < 3; i++) {
-        update_queue.AddImageSampler(texture_set, i, 0, null_surface.ImageView(),
-                                     null_sampler.Handle());
+    for (u32 i = 0; i < 4; i++) {
+        update_queue.AddImageSampler(texture_set, i, 0, null_surface_view, null_sampler.Handle());
     }
 
     const auto utility_set = pipeline_cache.Acquire(DescriptorHeapType::Utility);
-    update_queue.AddStorageImage(utility_set, 0, null_surface.StorageView());
-    update_queue.AddImageSampler(utility_set, 1, 0, null_surface.ImageView(),
-                                 null_sampler.Handle());
+    update_queue.AddStorageImage(utility_set, 0, null_surface_storage_view);
+    update_queue.AddImageSampler(utility_set, 1, 0, null_surface_view, null_sampler.Handle());
     update_queue.Flush();
 }
 
@@ -157,9 +161,15 @@ void RasterizerVulkan::LoadDefaultDiskResources(
         callback(VideoCore::LoadCallbackStage::Prepare, 0, 0, "");
     }
 
-    pipeline_cache.SetProgramID(program_id);
     pipeline_cache.SetAccurateMul(accurate_mul);
-    pipeline_cache.LoadCache(stop_loading, callback);
+    if (pipeline_cache.LoadCacheCrashed(program_id)) {
+        LOG_WARNING(Render_Vulkan,
+                    "Last load of the shader cache of title_id={:016X} crashed, not loading it",
+                    program_id);
+    } else {
+        pipeline_cache.SetProgramID(program_id);
+        pipeline_cache.LoadCache(stop_loading, callback);
+    }
 
     if (callback) {
         callback(VideoCore::LoadCallbackStage::Complete, 0, 0, "");
@@ -190,6 +200,11 @@ void RasterizerVulkan::SyncDrawState() {
     pipeline_info.state.blending.dst_alpha_blend_factor.Assign(
         regs.framebuffer.output_merger.alpha_blending.factor_dest_a);
     // SyncBlendColor();
+    const auto blend_color = PicaToVK::ColorRGBA8(regs.framebuffer.output_merger.blend_const.raw);
+    if (fs_data.blend_color != blend_color) {
+        fs_data.blend_color = blend_color;
+        fs_data_dirty = true;
+    }
     pipeline_info.dynamic_info.blend_color = regs.framebuffer.output_merger.blend_const.raw;
     // SyncLogicOp();
     // SyncColorWriteMask();
@@ -199,6 +214,12 @@ void RasterizerVulkan::SyncDrawState() {
                                ? (regs.framebuffer.output_merger.depth_color_mask >> 8) & 0xF
                                : 0;
     pipeline_info.state.blending.color_write_mask = color_mask;
+
+    bool rgb_blend_emulation = false;
+    bool alpha_blend_emulation = false;
+    pipeline_cache.QueryBlendEmulation(regs, rgb_blend_emulation, alpha_blend_emulation);
+    pipeline_info.state.blending.rgb_blend_emulation.Assign(rgb_blend_emulation);
+    pipeline_info.state.blending.alpha_blend_emulation.Assign(alpha_blend_emulation);
 
     // SyncStencilTest();
     const auto& stencil_test = regs.framebuffer.output_merger.stencil_test;
@@ -561,7 +582,7 @@ bool RasterizerVulkan::Draw(bool accelerate, bool is_indexed) {
     }
 
     const auto draw_rect = fb_helper.DrawRect();
-    if (draw_rect.GetHeight() * draw_rect.GetHeight() == 0) {
+    if (draw_rect.GetArea() == 0) {
         return true;
     }
 
@@ -646,17 +667,27 @@ void RasterizerVulkan::SyncTextureUnits(const Framebuffer* framebuffer) {
             switch (texture.config.type.Value()) {
             case TextureType::TextureCube:
             case TextureType::ShadowCube: {
-                Surface& null_surface = res_cache.GetSurface(VideoCore::NULL_SURFACE_CUBE_ID);
                 const Sampler& null_sampler = res_cache.GetSampler(VideoCore::NULL_SURFACE_CUBE_ID);
-                update_queue.AddImageSampler(texture_set, texture_index, 0,
-                                             null_surface.ImageView(), null_sampler.Handle());
+                if (instance.IsNullDescriptorSupported()) {
+                    update_queue.AddImageSampler(texture_set, texture_index, 0, vk::ImageView{},
+                                                 null_sampler.Handle());
+                } else {
+                    Surface& null_surface = res_cache.GetSurface(VideoCore::NULL_SURFACE_CUBE_ID);
+                    update_queue.AddImageSampler(texture_set, texture_index, 0,
+                                                 null_surface.ImageView(), null_sampler.Handle());
+                }
                 break;
             }
             default: {
-                Surface& null_surface = res_cache.GetSurface(VideoCore::NULL_SURFACE_ID);
                 const Sampler& null_sampler = res_cache.GetSampler(VideoCore::NULL_SURFACE_ID);
-                update_queue.AddImageSampler(texture_set, texture_index, 0,
-                                             null_surface.ImageView(), null_sampler.Handle());
+                if (instance.IsNullDescriptorSupported()) {
+                    update_queue.AddImageSampler(texture_set, texture_index, 0, vk::ImageView{},
+                                                 null_sampler.Handle());
+                } else {
+                    Surface& null_surface = res_cache.GetSurface(VideoCore::NULL_SURFACE_ID);
+                    update_queue.AddImageSampler(texture_set, texture_index, 0,
+                                                 null_surface.ImageView(), null_sampler.Handle());
+                }
                 break;
             }
             }
@@ -696,6 +727,15 @@ void RasterizerVulkan::SyncTextureUnits(const Framebuffer* framebuffer) {
             is_feedback_loop ? surface.CopyImageView() : surface.ImageView();
         update_queue.AddImageSampler(texture_set, texture_index, 0, texture_view, sampler.Handle());
     }
+
+    if ((pipeline_info.state.blending.rgb_blend_emulation ||
+         pipeline_info.state.blending.alpha_blend_emulation) &&
+        framebuffer->color_id) {
+        const Sampler& null_sampler = res_cache.GetSampler(VideoCore::NULL_SAMPLER_ID);
+        Surface& color_surface = res_cache.GetSurface(framebuffer->color_id);
+        update_queue.AddImageSampler(texture_set, 3, 0, color_surface.CopyImageView(),
+                                     null_sampler.Handle());
+    }
 }
 
 void RasterizerVulkan::SyncUtilityTextures(const Framebuffer* framebuffer) {
@@ -721,8 +761,12 @@ void RasterizerVulkan::SyncUtilityTextures(const Framebuffer* framebuffer) {
         Surface& shadow_surface = res_cache.GetTextureSurface(shadow_texture);
         update_queue.AddStorageImage(utility_set, 0, shadow_surface.StorageView());
     } else {
-        Surface& null_surface = res_cache.GetSurface(VideoCore::NULL_SURFACE_ID);
-        update_queue.AddStorageImage(utility_set, 0, null_surface.StorageView());
+        if (instance.IsNullDescriptorSupported()) {
+            update_queue.AddStorageImage(utility_set, 0, vk::ImageView{});
+        } else {
+            Surface& null_surface = res_cache.GetSurface(VideoCore::NULL_SURFACE_ID);
+            update_queue.AddStorageImage(utility_set, 0, null_surface.StorageView());
+        }
     }
 }
 
@@ -920,7 +964,7 @@ void RasterizerVulkan::SyncAndUploadLUTs() {
         sizeof(Common::Vec4f) * 256 +     // proctex
         sizeof(Common::Vec4f) * 256;      // proctex diff
 
-    if (!pica.proctex.lut_dirty) {
+    if (!pica.proctex.table_dirty) {
         return;
     }
 
@@ -959,7 +1003,7 @@ void RasterizerVulkan::SyncAndUploadLUTs() {
     }
 
     // Sync the proctex lut
-    if (pica.proctex.lut_dirty) {
+    if (pica.proctex.color_lut_dirty) {
         Common::Vec4f* new_data = reinterpret_cast<Common::Vec4f*>(buffer + bytes_used);
         for (u32 i = 0; i < proctex.color_table.size(); i++) {
             new_data[i] = proctex.color_table[i].ToVector() / 255.0f;
@@ -971,7 +1015,7 @@ void RasterizerVulkan::SyncAndUploadLUTs() {
     }
 
     // Sync the proctex difference lut
-    if (pica.proctex.diff_lut_dirty) {
+    if (pica.proctex.color_diff_lut_dirty) {
         Common::Vec4f* new_data = reinterpret_cast<Common::Vec4f*>(buffer + bytes_used);
         for (u32 i = 0; i < proctex.color_diff_table.size(); i++) {
             new_data[i] = proctex.color_diff_table[i].ToVector() / 255.0f;
@@ -1024,6 +1068,10 @@ void RasterizerVulkan::UploadUniforms(bool accelerate_draw) {
     }
 
     uniform_buffer.Commit(used_bytes);
+}
+
+bool RasterizerVulkan::DiskResourcesLoadCrashed(u64 title_id) {
+    return pipeline_cache.LoadCacheCrashed(title_id);
 }
 
 void RasterizerVulkan::SwitchDiskResources(u64 title_id) {

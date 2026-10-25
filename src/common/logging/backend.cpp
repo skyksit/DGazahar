@@ -1,6 +1,6 @@
 // Copyright 2014-2026 Citra Emulator Project / Azahar Emulator Project
 // Licensed under GPLv2 or any later version
-// Refer to the license.txt file included.
+// Refer to the misc/licenses/gplv2.txt file included.
 
 #include <chrono>
 #include <boost/algorithm/string/replace.hpp>
@@ -284,9 +284,6 @@ public:
         filter.ParseFilterString(Settings::values.log_filter.GetValue());
         instance = std::unique_ptr<Impl, decltype(&Deleter)>(new Impl(callback, filter), Deleter);
         initialization_in_progress_suppress_logging = false;
-        // Without this every LOG_* call takes the "logging before initialization" path in
-        // FmtLogMessageImpl and is written to stderr on the calling thread; LibRetroBackend, the
-        // only backend under HAVE_LIBRETRO, never sees a message (and on Android stderr goes nowhere).
         logging_initialized = true;
     }
 #endif
