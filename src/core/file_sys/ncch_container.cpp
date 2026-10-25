@@ -268,17 +268,47 @@ Loader::ResultStatus NCCHContainer::LoadHeader() {
     }
 
     if (!ncch_header.no_crypto) {
-        // DGPlayer: decrypt on read with the keys from the user's aes_keys.txt (same behaviour
-        // as Citra). Without the keys this still fails with ErrorEncrypted.
-        const auto keys = DeriveNCCHCryptoKeys(ncch_header);
-        if (!keys) {
-            return Loader::ResultStatus::ErrorEncrypted;
+        // DGPlayer: the jump ID of a readable exheader equals the program ID. The check is
+        // masked to the low 32 bits like Citra's, to tolerate ROMs merged with their updates.
+        auto exheader_is_plain = [this]() {
+            ExHeader_Header exheader;
+            if (file->ReadAtBytes(&exheader, sizeof(exheader), sizeof(NCCH_Header)) !=
+                sizeof(exheader)) {
+                return false;
+            }
+            return (exheader.system_info.jump_id & 0xFFFFFFFF) ==
+                   (ncch_header.program_id & 0xFFFFFFFF);
+        };
+
+        if (ncch_header.extended_header_size && exheader_is_plain()) {
+            // Decrypted dumps that kept the crypto flags (Citra boots them the same way).
+            // Decrypting plain data again would yield a garbage exheader and the kernel
+            // memory mode ASSERT would kill the process.
+            LOG_WARNING(Service_FS,
+                        "NCCH {:016X} is marked as encrypted but has a decrypted exheader. "
+                        "Forcing no crypto.",
+                        ncch_header.program_id);
+            ncch_header.no_crypto.Assign(1);
+        } else {
+            // DGPlayer: decrypt on read with the keys from the user's aes_keys.txt (same
+            // behaviour as Citra). Without the keys this still fails with ErrorEncrypted.
+            const auto keys = DeriveNCCHCryptoKeys(ncch_header);
+            if (!keys) {
+                return Loader::ResultStatus::ErrorEncrypted;
+            }
+            file = std::make_unique<NCCHDecryptIOFile>(std::move(file), ncch_header, *keys);
+            if (file->ReadAtBytes(&ncch_header, sizeof(NCCH_Header), 0) != sizeof(NCCH_Header)) {
+                return Loader::ResultStatus::Error;
+            }
+            // Wrong keys decrypt to garbage instead of failing; reject them here rather than
+            // booting a garbage exheader.
+            if (ncch_header.extended_header_size && !exheader_is_plain()) {
+                LOG_ERROR(Service_FS, "NCCH {:016X} did not decrypt with the provided keys",
+                          ncch_header.program_id);
+                return Loader::ResultStatus::ErrorEncrypted;
+            }
+            LOG_INFO(Service_FS, "Decrypting NCCH {:016X} on the fly", ncch_header.program_id);
         }
-        file = std::make_unique<NCCHDecryptIOFile>(std::move(file), ncch_header, *keys);
-        if (file->ReadAtBytes(&ncch_header, sizeof(NCCH_Header), 0) != sizeof(NCCH_Header)) {
-            return Loader::ResultStatus::Error;
-        }
-        LOG_INFO(Service_FS, "Decrypting NCCH {:016X} on the fly", ncch_header.program_id);
     }
 
     LOG_DEBUG(Service_FS, "NCCH type: {}", file->GetType().to_string());
