@@ -555,7 +555,14 @@ template <class T>
 typename T::Surface& RasterizerCache<T>::GetTextureSurface(
     const Pica::TexturingRegs::FullTextureConfig& config) {
     const auto info = Pica::Texture::TextureInfo::FromPicaRegister(config.config, config.format);
-    const u32 max_level = MipLevels(info.width, info.height, config.config.lod.max_level) - 1;
+    u32 max_level = MipLevels(info.width, info.height, config.config.lod.max_level) - 1;
+    // DGPlayer: mip levels smaller than one 8x8 tile (e.g. 256x256 RGB565 down to 4x4 in
+    // "101 Dino Pets 3D") break the tiled interval math: FromInterval rounds such a level up to a
+    // whole tile past surface.end (UploadSurface ASSERT) and later copies of it crash in
+    // vkCmdCopyImage. Drop those levels; sampling clamps to the 8x8 level, visually identical.
+    while (max_level > 0 && ((info.width >> max_level) < 8 || (info.height >> max_level) < 8)) {
+        --max_level;
+    }
     const SurfaceId surface_id = GetTextureSurface(info, max_level);
     return slot_surfaces[surface_id];
 }
