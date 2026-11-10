@@ -1040,8 +1040,31 @@ template <class T>
 void RasterizerCache<T>::UploadSurface(Surface& surface, SurfaceInterval interval) {
     MICROPROFILE_SCOPE(RasterizerCache_UploadSurface);
 
-    const SurfaceParams load_info = surface.FromInterval(interval);
-    ASSERT(load_info.addr >= surface.addr && load_info.end <= surface.end);
+    SurfaceParams load_info = surface.FromInterval(interval);
+
+    // DGPlayer: FromInterval rounds the interval up to whole (tiled) rows of `stride`, but a
+    // surface with stride > width ends at stride * (height - 1) + width, so an interval touching
+    // the last row can overshoot surface.end (e.g. 101 Dino Pets 3D). Upstream ASSERTs here and
+    // kills the process; drop the overshooting row groups instead and skip if that is not enough.
+    if (load_info.end > surface.end && load_info.addr >= surface.addr) [[unlikely]] {
+        const u32 row_step = load_info.is_tiled ? 8u : 1u;
+        while (load_info.end > surface.end && load_info.height > row_step) {
+            load_info.height -= row_step;
+            load_info.UpdateParams();
+        }
+    }
+    if (load_info.addr < surface.addr || load_info.end > surface.end) [[unlikely]] {
+        static bool warned = false;
+        if (!warned) {
+            warned = true;
+            LOG_WARNING(Render,
+                        "Skipping out-of-bounds surface upload: load [{:#x},{:#x}) "
+                        "surface [{:#x},{:#x}) stride={} width={}",
+                        load_info.addr, load_info.end, surface.addr, surface.end, surface.stride,
+                        surface.width);
+        }
+        return;
+    }
 
     const auto staging = runtime.FindStaging(
         load_info.width * load_info.height * surface.GetInternalBytesPerPixel(), true);
