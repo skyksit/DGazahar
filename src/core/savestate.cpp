@@ -2,8 +2,10 @@
 // Licensed under GPLv2 or any later version
 // Refer to the misc/licenses/gplv2.txt file included.
 
+#include <algorithm>
 #include <chrono>
 #include <sstream>
+#include <string_view>
 #include <cryptopp/hex.h>
 #include <fmt/ranges.h>
 #include "common/archives.h"
@@ -38,6 +40,27 @@ static_assert(sizeof(CSTHeader) == 256, "CSTHeader should be 256 bytes");
 
 constexpr std::array<u8, 4> header_magic_bytes{{'C', 'S', 'T', 0x1B}};
 
+// DGPlayer: upstream rejects any save state whose revision differs from the running build, even
+// when the serialized format is identical. DGPlayer ships rebuilt cores (new git hash) on the same
+// source, so list the revisions whose serialization is known to match this build. Only add a
+// hash after confirming `git diff <hash> HEAD` touches nothing that is serialized.
+//   9faa3e3 = CDN cores/8.0 (upstream 1edf59ef merge)
+//   f07f158 / 2b1e38d = test builds, 8dba6d7 = CDN cores/9.0 (rasterizer_cache.h only)
+constexpr std::array<std::string_view, 4> compatible_revisions{{
+    "9faa3e3cd05e76a5a4e271fb6b1c3492df336491",
+    "f07f158b8c8493c2bb1d5add94f310fb090102f9",
+    "2b1e38da0fbfff12ae61fa432c5616e7ea669dec",
+    "8dba6d7ca11843c179ae67ff6396d439566efb8e",
+}};
+
+static bool IsCompatibleRevision(const std::string& revision) {
+    if (revision == Common::g_scm_rev) {
+        return true;
+    }
+    return std::find(compatible_revisions.begin(), compatible_revisions.end(), revision) !=
+           compatible_revisions.end();
+}
+
 static std::string GetSaveStatePath(u64 program_id, u64 movie_id, u32 slot) {
     if (movie_id) {
         return fmt::format("{}{:016X}.movie{:016X}.{:02d}.cst",
@@ -68,7 +91,7 @@ static bool ValidateSaveState(const CSTHeader& header, SaveStateInfo& info, u64 
     const std::string build_version =
         header.zero_2 == 0 ? reinterpret_cast<const char*>(header.build_version.data()) : "";
 
-    if (revision == Common::g_scm_rev) {
+    if (IsCompatibleRevision(revision)) {
         info.status = SaveStateInfo::ValidationStatus::OK;
     } else {
         info.build_name = build_name;
@@ -298,7 +321,7 @@ bool System::LoadStateBuffer(std::vector<u8> buffer) {
         return false;
     }
     std::string revision = fmt::format("{:02x}", fmt::join(header.revision, ""));
-    if (revision != Common::g_scm_rev) {
+    if (!IsCompatibleRevision(revision)) {
         LOG_ERROR(Core,
                   "Save state file created from a different revision (core: {}, savestate: {})",
                   Common::g_scm_rev, revision);
