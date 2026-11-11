@@ -637,6 +637,14 @@ typename T::Surface& RasterizerCache<T>::GetTextureCube(const TextureCubeConfig&
         return slot_surfaces[NULL_SURFACE_CUBE_ID];
     }
 
+    // DGPlayer: same rule as GetTextureSurface(config) - never build cube levels smaller than one
+    // 8x8 tile. A 256x256 cube with mips down to 4x4 ("101 Dino Pets 3D") overshoots the face
+    // surface on upload and crashes Adreno in vkCmdCopyImage when copying the faces into the cube.
+    u32 levels = std::max(config.levels, 1u);
+    while (levels > 1 && (config.width >> (levels - 1)) < 8) {
+        --levels;
+    }
+
     auto [it, new_surface] = texture_cube_cache.try_emplace(config);
     TextureCube& cube = it->second;
 
@@ -659,10 +667,10 @@ typename T::Surface& RasterizerCache<T>::GetTextureCube(const TextureCubeConfig&
             SurfaceId& face_id = cube.face_ids[i];
             if (!face_id) {
                 info.physical_address = addresses[i];
-                face_id = GetTextureSurface(info, config.levels - 1);
+                face_id = GetTextureSurface(info, levels - 1);
                 Surface& surface = slot_surfaces[face_id];
                 ASSERT_MSG(
-                    surface.levels >= config.levels,
+                    surface.levels >= levels,
                     "Texture cube face levels are not enough to validate the levels requested");
                 surface.flags |= SurfaceFlagBits::Tracked;
             }
@@ -675,7 +683,7 @@ typename T::Surface& RasterizerCache<T>::GetTextureCube(const TextureCubeConfig&
             .width = config.width,
             .height = config.width,
             .stride = config.width,
-            .levels = config.levels,
+            .levels = levels,
             .res_scale = res_scale,
             .texture_type = TextureType::CubeMap,
             .pixel_format = PixelFormatFromTextureFormat(config.format),
@@ -697,7 +705,7 @@ typename T::Surface& RasterizerCache<T>::GetTextureCube(const TextureCubeConfig&
         }
         cube.ticks[i] = surface.modification_tick;
         boost::container::small_vector<TextureCopy, 8> upload_copies;
-        for (u32 level = 0; level < config.levels; level++) {
+        for (u32 level = 0; level < levels; level++) {
             const u32 width_lod = surface.GetScaledWidth() >> level;
             upload_copies.push_back({
                 .src_level = level,
